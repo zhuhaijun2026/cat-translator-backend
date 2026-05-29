@@ -205,7 +205,7 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
         filename = audio.filename or "audio.webm"
         suffix = os.path.splitext(filename)[1]
         if not suffix:
-            suffix = '.webm'
+            suffix = '.mp3'
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=suffix
         ) as tmp:
@@ -213,10 +213,14 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
         
-        # 第一步：语音识别
+        print(f"[human-audio-to-cat] 收到音频: {filename}, 大小: {len(content)} bytes")
+        
+        # 第一步：语音识别（stt.recognize 内部已做异常保护，不会抛异常）
         stt_result = stt.recognize(tmp_path, language="zh-CN")
         recognized_text = stt_result.get("text", "")
         stt_confidence = stt_result.get("confidence", 0.0)
+        
+        print(f"[human-audio-to-cat] 识别结果: '{recognized_text}' (置信度: {stt_confidence})")
         
         # 第二步：关键词匹配
         if recognized_text:
@@ -236,13 +240,17 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
             "intent": cat_result["intent"]
         }
         
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"人语翻译失败: {str(e)}"
-        )
+        print(f"[human-audio-to-cat] ❌ 处理失败: {e}")
+        # 不抛500，返回降级结果
+        return {
+            "text": "(翻译服务暂时不可用)",
+            "emotion": "困惑",
+            "confidence": 0,
+            "catSoundUrl": "/static/audio/cats/meow_happy.mp3",
+            "reply": "🐱 喵？翻译服务暂时不可用，请稍后再试",
+            "intent": "happy"
+        }
     finally:
         if tmp_path:
             try:
