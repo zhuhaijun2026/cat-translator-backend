@@ -189,10 +189,10 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
     
     tmp_path = None
     try:
-        filename = audio.filename or "audio.mp3"
+        filename = audio.filename or "audio.wav"
         suffix = os.path.splitext(filename)[1]
         if not suffix:
-            suffix = '.mp3'
+            suffix = '.wav'
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await audio.read()
             tmp.write(content)
