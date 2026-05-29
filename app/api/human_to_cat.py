@@ -173,7 +173,7 @@ async def human_to_cat(req: HumanToCatRequest):
     result = match_text_to_cat(text)
     return {
         "intent": result["intent"],
-        "catSoundUrl": f"/static/audio/cats/{result['cat_sound']}.mp3",
+        "catSoundUrl": f"/static/audio/cats/{result['cat_sound']}.wav",
         "reply": result["reply"]
     }
 
@@ -217,7 +217,7 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
             "text": recognized_text,
             "emotion": _intent_to_emotion(cat_result["intent"]),
             "confidence": int(stt_confidence * 100),
-            "catSoundUrl": f"/static/audio/cats/{cat_result['cat_sound']}.mp3",
+            "catSoundUrl": f"/static/audio/cats/{cat_result['cat_sound']}.wav",
             "reply": cat_result["reply"],
             "intent": cat_result["intent"]
         }
@@ -228,7 +228,7 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
             "text": "(翻译服务暂时不可用)",
             "emotion": "困惑",
             "confidence": 0,
-            "catSoundUrl": "/static/audio/cats/meow_happy.mp3",
+            "catSoundUrl": "/static/audio/cats/meow_happy.wav",
             "reply": "🐱 喵？翻译服务暂时不可用，请稍后再试",
             "intent": "happy"
         }
