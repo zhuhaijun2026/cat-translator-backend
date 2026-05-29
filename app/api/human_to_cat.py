@@ -5,7 +5,6 @@
 2. 音频输入 → STT转文字 → 猫叫映射（/human-audio-to-cat）
 """
 import os
-import uuid
 import tempfile
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
@@ -13,14 +12,11 @@ from app.services.stt import SpeechToText
 
 router = APIRouter()
 
-# STT实例
 stt = SpeechToText()
 
-# 人语意图 → 猫叫映射
-# ★ 重要：关键词按长度降序排列，长词优先匹配，避免短词误匹配
-# 例如"摸摸"不能被"饿"抢匹配
+# 人语意图 → 猫叫映射（按关键词长度降序，长词优先匹配）
 HUMAN_TO_CAT_MAP = [
-    # --- brushing（满足/摸摸/梳毛） → purr ---
+    # brushing（满足/摸摸/梳毛） → purr
     {"keyword": "梳毛", "intent": "brushing", "cat_sound": "purr",
      "reply": "🐱 呼噜噜～梳毛好舒服～"},
     {"keyword": "摸摸", "intent": "brushing", "cat_sound": "purr",
@@ -44,7 +40,7 @@ HUMAN_TO_CAT_MAP = [
     {"keyword": "撸", "intent": "brushing", "cat_sound": "purr",
      "reply": "🐱 呼噜噜～撸猫～"},
 
-    # --- food（饿了/吃饭） → meow_hungry ---
+    # food（饿了/吃饭） → meow_hungry
     {"keyword": "肚子饿了", "intent": "food", "cat_sound": "meow_hungry",
      "reply": "🐱 喵！开饭啦！"},
     {"keyword": "饿了吗", "intent": "food", "cat_sound": "meow_hungry",
@@ -72,7 +68,7 @@ HUMAN_TO_CAT_MAP = [
     {"keyword": "吃", "intent": "food", "cat_sound": "meow_hungry",
      "reply": "🐱 喵～开饭啦！"},
 
-    # --- angry（不满/制止） → hiss ---
+    # angry（不满/制止） → hiss
     {"keyword": "不要这样", "intent": "angry", "cat_sound": "hiss",
      "reply": "🐱 嘶～不可以这样！"},
     {"keyword": "不许", "intent": "angry", "cat_sound": "hiss",
@@ -92,7 +88,7 @@ HUMAN_TO_CAT_MAP = [
     {"keyword": "坏猫", "intent": "angry", "cat_sound": "hiss",
      "reply": "🐱 嘶～我才不坏！"},
 
-    # --- pain（痛苦/受伤） → meow_pain ---
+    # pain（痛苦/受伤） → meow_pain
     {"keyword": "不舒服", "intent": "pain", "cat_sound": "meow_pain",
      "reply": "🐱 喵呜...哪里不舒服？"},
     {"keyword": "受伤", "intent": "pain", "cat_sound": "meow_pain",
@@ -104,7 +100,7 @@ HUMAN_TO_CAT_MAP = [
     {"keyword": "疼", "intent": "pain", "cat_sound": "meow_pain",
      "reply": "🐱 喵呜...好疼..."},
 
-    # --- isolation（焦虑/害怕） → meow_anxious ---
+    # isolation（焦虑/害怕） → meow_anxious
     {"keyword": "一个人", "intent": "isolation", "cat_sound": "meow_anxious",
      "reply": "🐱 喵？不要留我一个人..."},
     {"keyword": "害怕", "intent": "isolation", "cat_sound": "meow_anxious",
@@ -116,7 +112,7 @@ HUMAN_TO_CAT_MAP = [
     {"keyword": "孤独", "intent": "isolation", "cat_sound": "meow_anxious",
      "reply": "🐱 喵？好孤单..."},
 
-    # --- happy（开心/友好） → meow_happy ---
+    # happy（开心/友好） → meow_happy
     {"keyword": "过来呀", "intent": "happy", "cat_sound": "meow_happy",
      "reply": "🐱 喵～来啦！"},
     {"keyword": "我爱你", "intent": "happy", "cat_sound": "meow_happy",
@@ -157,13 +153,8 @@ DEFAULT_RESPONSE = {
 
 
 def match_text_to_cat(text: str) -> dict:
-    """
-    根据识别出的文字匹配猫叫意图
-    ★ 核心逻辑：按关键词长度降序匹配，长词优先，避免短词误匹配
-    例如"摸摸"优先于"饿"匹配
-    """
+    """按关键词长度降序匹配，长词优先"""
     text = text.strip().lower()
-    # 按关键词长度降序排序，长词优先
     sorted_map = sorted(HUMAN_TO_CAT_MAP, key=lambda x: len(x["keyword"]), reverse=True)
     for item in sorted_map:
         if item["keyword"] in text:
@@ -177,9 +168,7 @@ class HumanToCatRequest(BaseModel):
 
 @router.post("/human-to-cat")
 async def human_to_cat(req: HumanToCatRequest):
-    """
-    人语文字 → 猫叫（纯文字输入）
-    """
+    """人语文字 → 猫叫"""
     text = req.text.strip().lower()
     result = match_text_to_cat(text)
     return {
@@ -193,36 +182,31 @@ async def human_to_cat(req: HumanToCatRequest):
 async def human_audio_to_cat(audio: UploadFile = File(...)):
     """
     人语音频 → STT转文字 → 猫叫映射
-    
-    流程：上传音频 → 语音识别 → 关键词匹配 → 返回猫叫
+    流程：上传音频 → 百度云语音识别 → 关键词匹配 → 返回猫叫
     """
     if not audio:
         raise HTTPException(status_code=400, detail="请上传音频文件")
     
     tmp_path = None
     try:
-        # 保存上传的音频到临时文件
-        filename = audio.filename or "audio.webm"
+        filename = audio.filename or "audio.mp3"
         suffix = os.path.splitext(filename)[1]
         if not suffix:
             suffix = '.mp3'
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=suffix
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await audio.read()
             tmp.write(content)
             tmp_path = tmp.name
         
         print(f"[human-audio-to-cat] 收到音频: {filename}, 大小: {len(content)} bytes")
         
-        # 第一步：语音识别（stt.recognize 内部已做异常保护，不会抛异常）
+        # 语音识别（stt内部优先百度云，备用Vosk）
         stt_result = stt.recognize(tmp_path, language="zh-CN")
         recognized_text = stt_result.get("text", "")
         stt_confidence = stt_result.get("confidence", 0.0)
         
         print(f"[human-audio-to-cat] 识别结果: '{recognized_text}' (置信度: {stt_confidence})")
         
-        # 第二步：关键词匹配
         if recognized_text:
             cat_result = match_text_to_cat(recognized_text)
         else:
@@ -233,16 +217,13 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
             "text": recognized_text,
             "emotion": _intent_to_emotion(cat_result["intent"]),
             "confidence": int(stt_confidence * 100),
-            "catSoundUrl": (
-                f"/static/audio/cats/{cat_result['cat_sound']}.mp3"
-            ),
+            "catSoundUrl": f"/static/audio/cats/{cat_result['cat_sound']}.mp3",
             "reply": cat_result["reply"],
             "intent": cat_result["intent"]
         }
         
     except Exception as e:
         print(f"[human-audio-to-cat] ❌ 处理失败: {e}")
-        # 不抛500，返回降级结果
         return {
             "text": "(翻译服务暂时不可用)",
             "emotion": "困惑",
@@ -260,7 +241,6 @@ async def human_audio_to_cat(audio: UploadFile = File(...)):
 
 
 def _intent_to_emotion(intent: str) -> str:
-    """意图转情绪标签"""
     emotion_map = {
         "food": "急切",
         "happy": "开心",
