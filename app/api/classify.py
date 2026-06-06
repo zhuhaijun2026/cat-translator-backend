@@ -1,11 +1,11 @@
 """
-猫叫分类 API
-接收音频文件，返回分类结果
+猫叫分类 API v3
+- 返回值增加 features_debug 字段，方便调试手机录音特征
 """
 import os
 import uuid
 import tempfile
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from app.services.classifier import CatSoundClassifier
 
 router = APIRouter()
@@ -49,22 +49,20 @@ INTENT_MAP = {
 
 
 @router.post("/classify")
-async def classify_sound(audio: UploadFile = File(...)):
+async def classify_sound(audio: UploadFile = File(...), debug: bool = Query(False)):
     """
     上传猫叫音频，返回分类结果
+    debug=true 时返回原始特征数据
     """
     if not audio:
         raise HTTPException(status_code=400, detail="请上传音频文件")
     
-    # 验证文件类型
     allowed_types = ["audio/mpeg", "audio/wav", "audio/mp3", "audio/x-m4a", "audio/webm", "audio/ogg"]
     content_type = audio.content_type or ""
     if content_type not in allowed_types:
-        # 宽松验证，有些设备content_type不准
         pass
     
     try:
-        # 保存上传文件到临时目录
         filename = audio.filename or "audio.webm"
         suffix = os.path.splitext(filename)[1]
         if not suffix:
@@ -84,7 +82,7 @@ async def classify_sound(audio: UploadFile = File(...)):
         # 清理临时文件
         os.unlink(tmp_path)
         
-        return {
+        response = {
             "text": intent_info["text"],
             "emotion": intent_info["emotion"],
             "confidence": int(result.get("confidence", 0) * 100),
@@ -96,11 +94,52 @@ async def classify_sound(audio: UploadFile = File(...)):
             }
         }
         
+        # debug模式返回原始特征
+        if debug or result.get("features_debug"):
+            response["features"] = result.get("features_debug", {})
+        
+        return response
+        
     except Exception as e:
-        # 确保清理临时文件
         if 'tmp_path' in locals():
             try:
                 os.unlink(tmp_path)
             except:
                 pass
         raise HTTPException(status_code=500, detail=f"分类失败: {str(e)}")
+
+
+@router.post("/extract-features")
+async def extract_features_endpoint(audio: UploadFile = File(...)):
+    """
+    提取音频特征（调试用）
+    返回原始特征数据，不做分类
+    """
+    if not audio:
+        raise HTTPException(status_code=400, detail="请上传音频文件")
+    
+    try:
+        filename = audio.filename or "audio.webm"
+        suffix = os.path.splitext(filename)[1]
+        if not suffix:
+            suffix = '.webm'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            content = await audio.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        features = classifier.extract_features(tmp_path)
+        os.unlink(tmp_path)
+        
+        return {
+            "status": "ok",
+            "features": features
+        }
+        
+    except Exception as e:
+        if 'tmp_path' in locals():
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"特征提取失败: {str(e)}")
