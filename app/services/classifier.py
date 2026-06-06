@@ -1,10 +1,12 @@
 """
 猫叫分类器服务 v5
 - v4基础上修复：f0_std用IQR异常值过滤后的robust版本
-- 核心发现：pyin在间歇性猫叫过渡帧产生八度跳跃错误(~203Hz vs 真实~440Hz)
+- 核心发现1：pyin在间歇性猫叫过渡帧产生八度跳跃错误(~203Hz vs 真实~440Hz)
   23%帧是八度错误，虚增f0_std从6.5→94.6，导致驱虫声误判pain
-- 修复方案：提取f0后用IQR过滤异常值再计算mean/std，真实变化保留，八度错误被过滤
-- 同时调整pain阈值适配robust f0_std
+- 核心发现2：猫驱虫/驱赶飞虫的chattering声学特征像呼噜(centroid低、flatness低、f0稳)
+  但实际上有大量中高频能量(meow成分)，纯呼噜500Hz以上能量<5%，chattering>30%
+  → 新增high_freq_energy_ratio特征，brushing决策树增加hf_ratio<0.15限制
+- 修复方案：IQR过滤 + hf_ratio区分呼噜与chattering
 """
 import os
 import subprocess
@@ -22,9 +24,12 @@ class CatSoundClassifier:
     1. ★ f0_std改用IQR过滤后的robust版本（消除pyin八度跳跃错误）
        - 驱虫声raw f0_std=94.6 → robust f0_std=6.5，不再误判pain
        - 真正痛苦声的f0变化是真实的、跨多帧的，IQR过滤后仍高
-    2. brushing决策树f0_std阈值收紧：<20（robust版更稳定，真实呼噜<5）
-    3. pain规则阈值适配robust f0_std：长痛>50，剧烈>40+ratio>0.15
-    4. 所有决策树和评分规则统一使用robust版本
+    2. ★ 新增high_freq_energy_ratio特征：500Hz以上频段能量占总能量比例
+       - 纯呼噜: <0.05, chattering/驱虫: >0.30, meow: >0.60
+       - brushing决策树增加hf_ratio<0.15限制，防止chattering误判brushing
+    3. brushing决策树f0_std阈值收紧：<20（robust版更稳定，真实呼噜<5）
+    4. pain规则阈值适配robust f0_std：长痛>50，剧烈>40+ratio>0.15
+    5. 所有决策树和评分规则统一使用robust版本
     """
     
     LABELS = ["brushing", "food", "isolation", "happy", "angry", "pain"]
@@ -190,6 +195,18 @@ class CatSoundClassifier:
                 f0_median = 0
                 voiced_ratio = 0
             
+            # ★ v5新增: 高频能量比 — 区分纯呼噜与chattering
+            # 纯呼噜能量集中在<200Hz，500Hz以上<5%
+            # chattering/驱虫声有meow成分，500Hz以上>30%
+            try:
+                S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
+                fft_freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+                total_energy = np.sum(S)
+                high_freq_energy = np.sum(S[fft_freqs > 500, :])
+                high_freq_energy_ratio = float(high_freq_energy / total_energy) if total_energy > 0 else 0.0
+            except:
+                high_freq_energy_ratio = 0.0
+            
             # RMS帧级统计
             rms_frame = librosa.feature.rms(y=y)[0]
             rms_std = float(np.std(rms_frame)) if len(rms_frame) > 1 else 0.0
@@ -214,6 +231,7 @@ class CatSoundClassifier:
                 "f0_range_raw": f0_range_raw, # 调试对比用
                 "voiced_ratio": voiced_ratio,
                 "rms_std": rms_std,
+                "high_freq_energy_ratio": high_freq_energy_ratio,  # ★ v5新增
             }
             
             return features
@@ -291,21 +309,23 @@ class CatSoundClassifier:
         f0_range = features.get("f0_range", 0)     # ★ v5: robust
         f0_median = features.get("f0_median", 0)   # ★ v5新增
         voiced_ratio = features.get("voiced_ratio", 0)
+        hf_ratio = features.get("high_freq_energy_ratio", 0)  # ★ v5新增
         
         # ============================================================
         # 第一层：决策树快速判断（铁证级别，不进评分）
         # ============================================================
         
-        # 规则1: 呼噜 — centroid极低 + flatness极低 + f0_std极低
-        # ★ v5: robust f0_std真实呼噜<5，收紧到<20更准确
-        if centroid < 1200 and flatness < 0.01 and f0_std < 20:
+        # 规则1: 呼噜 — centroid极低 + flatness极低 + f0_std极低 + 高频能量极低
+        # ★ v5核心: hf_ratio<0.15 区分纯呼噜与chattering
+        # 纯呼噜: 500Hz以上能量<5%, chattering/驱虫: >30%, meow: >60%
+        if centroid < 1200 and flatness < 0.01 and f0_std < 20 and hf_ratio < 0.15:
             return {
                 "intent": "brushing",
                 "confidence": 0.90,
                 "all_probs": {"brushing": 0.90, "food": 0.04, "isolation": 0.02, 
                               "happy": 0.02, "angry": 0.01, "pain": 0.01},
                 "features_debug": features,
-                "rule_hit": "decision_tree: brushing (centroid<1200 + flatness<0.01 + robust_f0_std<20)"
+                "rule_hit": "decision_tree: brushing (centroid<1200 + flatness<0.01 + robust_f0_std<20 + hf_ratio<0.15)"
             }
         
         # 规则2: 痛苦/哀鸣 — 长时 + f0剧烈波动（robust版）
@@ -396,6 +416,7 @@ class CatSoundClassifier:
         
         # --- BRUSHING (评分兜底) ---
         # ★ v5: robust f0_std更准确，呼噜<5，非呼噜>10
+        # ★ v5: hf_ratio>0.15说明有meow成分，不是纯呼噜
         if f0_std < 10:
             scores["brushing"] += 5  # 极稳定f0，强呼噜信号
         elif f0_std < 20:
@@ -404,6 +425,18 @@ class CatSoundClassifier:
             scores["brushing"] -= 4  # robust版还高说明真有波动
         elif f0_std > 20:
             scores["brushing"] -= 2
+        
+        # ★ v5新增: 高频能量比 — chattering/驱虫有大量中高频能量
+        # 这是最关键的呼噜/chattering区分信号，权重必须足够大
+        # 纯呼噜: hf<0.05, chattering: 0.30-0.50, meow: >0.60
+        if hf_ratio < 0.05:
+            scores["brushing"] += 6  # 几乎无中高频，纯呼噜
+        elif hf_ratio < 0.15:
+            scores["brushing"] += 2  # 中高频很少
+        if hf_ratio > 0.30:
+            scores["brushing"] -= 12  # ★ 强否决：中高频很多，绝不是呼噜
+        elif hf_ratio > 0.15:
+            scores["brushing"] -= 5  # 中高频较多，可疑
         
         if centroid < 1200:
             scores["brushing"] += 6
@@ -426,6 +459,11 @@ class CatSoundClassifier:
         elif 600 < centroid < 2800:
             scores["food"] += 3
         
+        # ★ v5: centroid极低但hf_ratio高 → chattering(驱虫)也走food路径
+        # chattering的centroid被低频呼噜成分拉低，但hf_ratio揭示meow成分
+        if centroid < 800 and hf_ratio > 0.25:
+            scores["food"] += 5  # 低centroid但高频能量高 = chattering
+        
         if 0.3 < duration < 2.5:
             scores["food"] += 2
         
@@ -442,6 +480,12 @@ class CatSoundClassifier:
             scores["food"] += 2
         
         if 300 < f0_mean < 1200:
+            scores["food"] += 2
+        
+        # ★ v5新增: hf_ratio高说明有meow成分（chattering/驱虫也走food路径）
+        if hf_ratio > 0.30:
+            scores["food"] += 4  # 大量meow频段能量
+        elif hf_ratio > 0.15:
             scores["food"] += 2
         
         # --- ISOLATION (评分兜底) ---
