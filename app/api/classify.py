@@ -1,7 +1,7 @@
 """
-猫叫分类 API v4
-- 返回值增加 features_debug 字段，方便调试手机录音特征
-- v4: classify端点默认返回features字段（不再需要debug参数）
+猫叫分类 API v5
+- v5: f0特征改用IQR过滤后的robust版本，消除pyin八度跳跃错误
+- 调试接口返回raw和robust两个版本的特征，方便对比
 """
 import os
 import uuid
@@ -96,17 +96,21 @@ async def classify_sound(audio: UploadFile = File(...), debug: bool = Query(Fals
             }
         }
         
-        # 始终返回关键特征（v4改动：不再需要debug参数）
+        # ★ v5: 返回robust和raw两个版本的关键特征
         features = result.get("features_debug", {})
         response["features"] = {
             "spectral_centroid": features.get("spectral_centroid"),
             "zcr": features.get("zcr"),
             "spectral_flatness": features.get("spectral_flatness"),
             "duration": features.get("duration"),
-            "f0_mean": features.get("f0_mean"),
-            "f0_std": features.get("f0_std"),
-            "f0_range": features.get("f0_range"),
+            "f0_mean": features.get("f0_mean"),           # robust
+            "f0_std": features.get("f0_std"),             # robust
+            "f0_range": features.get("f0_range"),         # robust
+            "f0_median": features.get("f0_median"),       # v5新增
             "voiced_ratio": features.get("voiced_ratio"),
+            # raw版本对比
+            "f0_std_raw": features.get("f0_std_raw"),
+            "f0_mean_raw": features.get("f0_mean_raw"),
         }
         
         if debug:
