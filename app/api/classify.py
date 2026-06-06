@@ -1,7 +1,7 @@
 """
-猫叫分类 API v5
-- v5: f0特征改用IQR过滤后的robust版本，消除pyin八度跳跃错误
-- 调试接口返回raw和robust两个版本的特征，方便对比
+猫叫分类 API v6
+- v6: 新增chattering(兴奋/追逐)类别
+- 驱赶飞虫、驱虫声不再误判为food，正确识别为chattering
 """
 import os
 import uuid
@@ -14,7 +14,7 @@ router = APIRouter()
 # 初始化分类器（全局单例）
 classifier = CatSoundClassifier()
 
-# 猫叫意图映射表
+# 猫叫意图映射表 — ★ v6新增chattering
 INTENT_MAP = {
     "brushing": {
         "text": "好舒服呀，继续摸我～",
@@ -45,6 +45,11 @@ INTENT_MAP = {
         "text": "我不舒服...快帮帮我",
         "emotion": "痛苦",
         "cat_sound": "meow_pain"
+    },
+    "chattering": {
+        "text": "别跑！我要抓住你！",
+        "emotion": "兴奋",
+        "cat_sound": "chatter"
     }
 }
 
@@ -96,20 +101,19 @@ async def classify_sound(audio: UploadFile = File(...), debug: bool = Query(Fals
             }
         }
         
-        # ★ v5: 返回robust和raw两个版本的关键特征
+        # 返回关键特征
         features = result.get("features_debug", {})
         response["features"] = {
             "spectral_centroid": features.get("spectral_centroid"),
             "zcr": features.get("zcr"),
             "spectral_flatness": features.get("spectral_flatness"),
             "duration": features.get("duration"),
-            "f0_mean": features.get("f0_mean"),           # robust
-            "f0_std": features.get("f0_std"),             # robust
-            "f0_range": features.get("f0_range"),         # robust
-            "f0_median": features.get("f0_median"),       # v5新增
+            "f0_mean": features.get("f0_mean"),
+            "f0_std": features.get("f0_std"),
+            "f0_range": features.get("f0_range"),
+            "f0_median": features.get("f0_median"),
             "voiced_ratio": features.get("voiced_ratio"),
-            "high_freq_energy_ratio": features.get("high_freq_energy_ratio"),  # v5新增
-            # raw版本对比
+            "high_freq_energy_ratio": features.get("high_freq_energy_ratio"),
             "f0_std_raw": features.get("f0_std_raw"),
             "f0_mean_raw": features.get("f0_mean_raw"),
         }
