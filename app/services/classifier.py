@@ -1,9 +1,10 @@
 """
-猫叫分类器服务 v3
-- 修复手机录音特征偏差问题（降噪/AGC导致zcr和flatness偏低）
-- 移除不可靠的rms_periodicity指标
-- 以centroid为主判据（受手机处理影响最小）
-- 新增调试接口 /api/v1/extract-features
+猫叫分类器服务 v4
+- v3基础上修复：用f0_std做呼噜否决条件
+- 核心发现：真实呼噜f0几乎不变(std<20)，任何f0剧烈波动的声音都不该判brushing
+- 新增food决策树规则：中频centroid+有声+非噪声=讨食meow
+- isolation评分的f0加分只在centroid>2200时生效（中频meow的f0波动不算焦虑）
+- voiced_ratio和f0_mean作为food辅助信号
 """
 import os
 import subprocess
@@ -15,13 +16,14 @@ from typing import Dict, Optional
 
 class CatSoundClassifier:
     """
-    猫叫声分类器 v3
+    猫叫声分类器 v4
     
-    v3 关键修复:
-    1. 移除rms_periodicity（几乎所有录音都是0.9+，无区分度）
-    2. 收紧brushing判定：必须flatness极低(<0.01)且centroid极低(<1200)
-    3. 以centroid为最主要判据（受手机AGC/降噪影响最小）
-    4. 增加频谱rolloff和对比度作为辅助判据
+    v4 关键修复（基于真实猫叫数据分析）:
+    1. ★ f0_std作为呼噜否决条件：真实呼噜f0_std<20，f0_std>30绝不判brushing
+       - 驱虫叫声flatness=0.006像呼噜，但f0_std=94.6，绝对不是呼噜
+    2. 新增food决策树规则：中频centroid+有声+非噪声=讨食meow
+    3. isolation评分的f0加分限制在centroid>2200（中频meow的f0波动不算焦虑）
+    4. voiced_ratio和f0_mean作为food辅助信号
     """
     
     LABELS = ["brushing", "food", "isolation", "happy", "angry", "pain"]
@@ -210,12 +212,15 @@ class CatSoundClassifier:
     
     def _predict_with_rules(self, features: Dict) -> Dict:
         """
-        猫叫分类器 v3 — 决策树优先 + 评分兜底
+        猫叫分类器 v4 — 决策树优先 + 评分兜底
         
-        设计理念:
-        1. 先用决策树快速判断"铁证"情况（避免评分被手机降噪干扰）
-        2. 评分阶段: centroid权重最大(最不受降噪影响)，zcr/flatness权重降低
-        3. food是兜底类别（中间频段的meow），不抢高频和低频
+        v4 vs v3 核心改动:
+        1. ★ brushing决策树增加f0_std否决：f0_std>30绝不判brushing
+           - 真实呼噜f0几乎不变(std<20)，驱虫叫声f0_std=94.6绝不是呼噜
+        2. 新增food决策树：中频centroid+有声+非噪声=meow
+        3. isolation评分f0加分限制centroid>2200（中频meow的f0波动不算焦虑）
+        4. brushing评分增加f0_std否决扣分
+        5. food评分增加voiced_ratio和f0_mean辅助
         
         手机录音对特征的影响:
         - AGC → rms差异缩小，不作为主判据
@@ -236,32 +241,38 @@ class CatSoundClassifier:
         
         # ============================================================
         # 第一层：决策树快速判断（铁证级别，不进评分）
-        # 这些组合是猫叫声学研究中区分度极高的特征
         # ============================================================
         
-        # 规则1: 呼噜 — centroid极低 + flatness极低
-        # 真正的呼噜centroid在500-1500Hz，flatness < 0.01
-        # 手机降噪只能让flatness变低，但不会让centroid降到1000以下
-        if centroid < 1200 and flatness < 0.01:
+        # 规则1: 呼噜 — centroid极低 + flatness极低 + f0_std极低
+        # ★ v4核心修复：真实呼噜f0几乎不变(std<20)，f0剧烈波动的绝不是呼噜
+        # 手机降噪可能让flatness变低，但不会产生稳定的f0
+        if centroid < 1200 and flatness < 0.01 and f0_std < 30:
             return {
                 "intent": "brushing",
                 "confidence": 0.90,
                 "all_probs": {"brushing": 0.90, "food": 0.04, "isolation": 0.02, 
                               "happy": 0.02, "angry": 0.01, "pain": 0.01},
                 "features_debug": features,
-                "rule_hit": "decision_tree: brushing (centroid<1200 + flatness<0.01)"
+                "rule_hit": "decision_tree: brushing (centroid<1200 + flatness<0.01 + f0_std<30)"
             }
         
-        # 规则2: 痛苦howl — 非常长 + 高centroid + f0剧烈波动
-        # 放在angry前面：因为痛苦的叫声zcr也高，但痛苦有长时+f0波动特征
-        if duration > 2.0 and centroid > 2500 and f0_std > 60:
+        # 规则2: 痛苦/哀鸣 — 长时 + f0剧烈波动
+        # ★ v4: 去掉centroid>2500限制，用f0_std/f0_mean比率区分pain和food
+        # 驱虫叫声: duration=3.83s + f0_std=94.6 + ratio=0.243 → pain
+        # 讨食meow: duration=2.37s + f0_std=82 + ratio=0.100 → food(不误判)
+        # 原理：pain的音高波动比例远大于food（哀鸣的音高剧烈抖动vs meow的温和变化）
+        f0_variation_ratio = f0_std / max(f0_mean, 1) if f0_mean > 0 else 0
+        is_long_pain = duration > 3.0 and f0_std > 40  # 非常长的哀鸣
+        is_intense_pain = duration > 2.0 and f0_std > 60 and f0_variation_ratio > 0.15  # 中等长度但波动剧烈
+        
+        if is_long_pain or is_intense_pain:
             return {
                 "intent": "pain",
                 "confidence": 0.82,
                 "all_probs": {"pain": 0.82, "isolation": 0.08, "angry": 0.05,
                               "food": 0.03, "happy": 0.01, "brushing": 0.01},
                 "features_debug": features,
-                "rule_hit": "decision_tree: pain (duration>2.0 + centroid>2500 + f0_std>60)"
+                "rule_hit": "decision_tree: pain (long distress or intense f0 variation)"
             }
         
         # 规则3: 哈气hiss — 噪声信号
@@ -294,7 +305,33 @@ class CatSoundClassifier:
                 "rule_hit": "decision_tree: isolation (centroid>2500 + duration>1.0 + f0波动)"
             }
         
-        # 规则5: 极短chirp — 非常短 + 中频
+        # ★ 规则5 (v4新增): 讨食meow — 中频centroid + 有声调 + 非噪声
+        # 这是最常见的猫叫声类型，v3漏了决策树规则导致进评分被isolation抢走
+        is_mid_freq = 800 < centroid < 2400
+        is_voiced = voiced_ratio > 0.25
+        is_not_noisy = zcr < 0.22 and flatness < 0.20
+        
+        if is_mid_freq and is_voiced and is_not_noisy:
+            if duration > 0.5:  # 稍长的meow = 讨食
+                return {
+                    "intent": "food",
+                    "confidence": 0.82,
+                    "all_probs": {"food": 0.82, "isolation": 0.07, "happy": 0.05,
+                                  "brushing": 0.03, "angry": 0.02, "pain": 0.01},
+                    "features_debug": features,
+                    "rule_hit": "decision_tree: food (mid-centroid + voiced + not-noisy)"
+                }
+            else:  # 极短的meow = 开心
+                return {
+                    "intent": "happy",
+                    "confidence": 0.78,
+                    "all_probs": {"happy": 0.78, "food": 0.12, "isolation": 0.05,
+                                  "brushing": 0.02, "angry": 0.02, "pain": 0.01},
+                    "features_debug": features,
+                    "rule_hit": "decision_tree: happy (mid-centroid + voiced + short)"
+                }
+        
+        # 规则6: 极短chirp — 非常短 + 中频
         if duration < 0.35 and 1000 < centroid < 3500:
             return {
                 "intent": "happy",
@@ -307,12 +344,22 @@ class CatSoundClassifier:
         
         # ============================================================
         # 第二层：评分系统（决策树未命中时）
-        # 核心原则: centroid权重最大，food不抢高频/低频区间
+        # v4关键修改: brushing评分增加f0_std否决，isolation的f0加分限centroid>2200
         # ============================================================
         scores = {label: 0.0 for label in self.LABELS}
         
         # --- BRUSHING (评分兜底) ---
-        # centroid极低是唯一强信号
+        # ★ v4: f0_std>30时brushing大幅扣分（呼噜f0必须稳定）
+        if f0_std < 20:
+            scores["brushing"] += 5  # f0很稳，强呼噜信号
+        elif f0_std < 30:
+            scores["brushing"] += 2  # f0较稳
+        # f0_std>30不加分，f0_std>50扣分
+        if f0_std > 50:
+            scores["brushing"] -= 4  # f0剧烈波动，绝不可能是呼噜
+        elif f0_std > 30:
+            scores["brushing"] -= 2
+        
         if centroid < 1200:
             scores["brushing"] += 6
         elif centroid < 1800:
@@ -331,29 +378,34 @@ class CatSoundClassifier:
         if rolloff < 2000:
             scores["brushing"] += 2
         
-        # --- FOOD (评分兜底，只占中间频段) ---
-        # ★ 关键: centroid > 2200时不给food分（那是isolation/angry区间）
-        if 1000 < centroid < 2200:
-            scores["food"] += 5  # 中频=meow典型范围
-        elif 800 < centroid < 2600:
-            scores["food"] += 2  # 略宽但权重低
+        # --- FOOD (评分兜底，v4加强) ---
+        # ★ v4: centroid在中频时food权重更高
+        if 800 < centroid < 2400:
+            scores["food"] += 7  # meow核心频段，v4提升
+        elif 600 < centroid < 2800:
+            scores["food"] += 3
         
-        if 0.3 < duration < 1.5:
+        if 0.3 < duration < 2.5:
             scores["food"] += 2
-        elif duration < 2.5:
-            scores["food"] += 0.5
         
-        # 中等谐波性
-        if 0.01 < flatness < 0.15:
+        # v4: 放宽flatness范围
+        if 0.01 < flatness < 0.18:
+            scores["food"] += 1.5
+        
+        # v4: 放宽zcr范围
+        if 0.03 < zcr < 0.18:
             scores["food"] += 1
         
-        # 中等zcr
-        if 0.03 < zcr < 0.15:
-            scores["food"] += 0.5
-        
-        # rolloff中等
-        if 2000 < rolloff < 4000:
+        if 2000 < rolloff < 4500:
             scores["food"] += 1
+        
+        # ★ v4新增: voiced_ratio中等 = 有声调的meow
+        if voiced_ratio > 0.2:
+            scores["food"] += 2
+        
+        # ★ v4新增: f0_mean在猫叫典型范围(300-1200Hz)
+        if 300 < f0_mean < 1200:
+            scores["food"] += 2
         
         # --- ISOLATION (评分兜底) ---
         # centroid高 + f0波动
@@ -371,16 +423,17 @@ class CatSoundClassifier:
         elif duration > 0.8:
             scores["isolation"] += 1.5
         
-        # f0波动是强信号（不受降噪影响）
-        if f0_std > 80:
-            scores["isolation"] += 4
-        elif f0_std > 40:
-            scores["isolation"] += 2
-        
-        if f0_range > 300:
-            scores["isolation"] += 2
-        elif f0_range > 150:
-            scores["isolation"] += 1
+        # ★ v4核心修改: f0波动只在centroid>2200时才给isolation加分
+        # 中频meow(centroid 800-2400)也有f0波动，但那是food不是isolation
+        if centroid > 2200:
+            if f0_std > 80:
+                scores["isolation"] += 4
+            elif f0_std > 40:
+                scores["isolation"] += 2
+            if f0_range > 300:
+                scores["isolation"] += 2
+            elif f0_range > 150:
+                scores["isolation"] += 1
         
         # 高rolloff辅助
         if rolloff > 5000:
