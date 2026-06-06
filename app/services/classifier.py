@@ -348,10 +348,27 @@ class CatSoundClassifier:
                 "rule_hit": "decision_tree: chattering (centroid 1500-2000 + flatness<0.02 + hf_ratio>0.40 + f0_std<25)"
             }
         
-        # 规则3: 痛苦/哀鸣 — 长时 + f0剧烈波动
+        # 规则3: 痛苦/哀鸣 — 长时 + f0剧烈波动 + 高centroid
+        # ★ v6.1: 区分痛苦(高频wailing)和烦躁(低频反复叫)
+        #   痛苦哀鸣: centroid>1500 (高频wailing) + f0波动大
+        #   烦躁不满: centroid<1500 (低频反复叫) + f0波动大 → 归入angry
         f0_variation_ratio = f0_std / max(f0_mean, 1) if f0_mean > 0 else 0
-        is_long_pain = duration > 3.0 and f0_std > 50
-        is_intense_pain = duration > 2.0 and f0_std > 40 and f0_variation_ratio > 0.15
+        is_long_pain = duration > 3.0 and f0_std > 50 and centroid > 1500  # ★ v6.1: 加centroid>1500
+        is_intense_pain = duration > 2.0 and f0_std > 40 and f0_variation_ratio > 0.15 and centroid > 1500  # ★ v6.1: 加centroid>1500
+        
+        # ★ v6.1新增: 烦躁/不满 — 长时 + f0波动大 + 低centroid (反复低音叫)
+        # 这不是痛苦哀鸣(高音wailing)，而是烦躁地反复叫
+        is_irritated = duration > 2.0 and f0_std > 40 and centroid < 1500
+        
+        if is_irritated:
+            return {
+                "intent": "angry",
+                "confidence": 0.82,
+                "all_probs": {"angry": 0.82, "pain": 0.06, "isolation": 0.04,
+                              "food": 0.03, "chattering": 0.02, "happy": 0.02, "brushing": 0.01},
+                "features_debug": features,
+                "rule_hit": "decision_tree: angry/irritated (long + high f0_std + low centroid)"
+            }
         
         if is_long_pain or is_intense_pain:
             return {
@@ -360,7 +377,7 @@ class CatSoundClassifier:
                 "all_probs": {"pain": 0.82, "isolation": 0.07, "angry": 0.04,
                               "food": 0.03, "chattering": 0.02, "happy": 0.01, "brushing": 0.01},
                 "features_debug": features,
-                "rule_hit": "decision_tree: pain (long distress or intense f0 variation)"
+                "rule_hit": "decision_tree: pain (long + high f0_std + centroid>1500)"
             }
         
         # 规则4: 哈气hiss — 噪声信号
