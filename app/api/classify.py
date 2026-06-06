@@ -108,6 +108,7 @@ async def classify_sound(audio: UploadFile = File(...), debug: bool = Query(Fals
             "f0_range": features.get("f0_range"),         # robust
             "f0_median": features.get("f0_median"),       # v5新增
             "voiced_ratio": features.get("voiced_ratio"),
+            "high_freq_energy_ratio": features.get("high_freq_energy_ratio"),  # v5新增
             # raw版本对比
             "f0_std_raw": features.get("f0_std_raw"),
             "f0_mean_raw": features.get("f0_mean_raw"),
