@@ -1,10 +1,10 @@
 """
-猫叫分类器服务 v4
-- v3基础上修复：用f0_std做呼噜否决条件
-- 核心发现：真实呼噜f0几乎不变(std<20)，任何f0剧烈波动的声音都不该判brushing
-- 新增food决策树规则：中频centroid+有声+非噪声=讨食meow
-- isolation评分的f0加分只在centroid>2200时生效（中频meow的f0波动不算焦虑）
-- voiced_ratio和f0_mean作为food辅助信号
+猫叫分类器服务 v5
+- v4基础上修复：f0_std用IQR异常值过滤后的robust版本
+- 核心发现：pyin在间歇性猫叫过渡帧产生八度跳跃错误(~203Hz vs 真实~440Hz)
+  23%帧是八度错误，虚增f0_std从6.5→94.6，导致驱虫声误判pain
+- 修复方案：提取f0后用IQR过滤异常值再计算mean/std，真实变化保留，八度错误被过滤
+- 同时调整pain阈值适配robust f0_std
 """
 import os
 import subprocess
@@ -16,14 +16,15 @@ from typing import Dict, Optional
 
 class CatSoundClassifier:
     """
-    猫叫声分类器 v4
+    猫叫声分类器 v5
     
-    v4 关键修复（基于真实猫叫数据分析）:
-    1. ★ f0_std作为呼噜否决条件：真实呼噜f0_std<20，f0_std>30绝不判brushing
-       - 驱虫叫声flatness=0.006像呼噜，但f0_std=94.6，绝对不是呼噜
-    2. 新增food决策树规则：中频centroid+有声+非噪声=讨食meow
-    3. isolation评分的f0加分限制在centroid>2200（中频meow的f0波动不算焦虑）
-    4. voiced_ratio和f0_mean作为food辅助信号
+    v5 vs v4 核心改动:
+    1. ★ f0_std改用IQR过滤后的robust版本（消除pyin八度跳跃错误）
+       - 驱虫声raw f0_std=94.6 → robust f0_std=6.5，不再误判pain
+       - 真正痛苦声的f0变化是真实的、跨多帧的，IQR过滤后仍高
+    2. brushing决策树f0_std阈值收紧：<20（robust版更稳定，真实呼噜<5）
+    3. pain规则阈值适配robust f0_std：长痛>50，剧烈>40+ratio>0.15
+    4. 所有决策树和评分规则统一使用robust版本
     """
     
     LABELS = ["brushing", "food", "isolation", "happy", "angry", "pain"]
@@ -46,7 +47,7 @@ class CatSoundClassifier:
         if model_path and os.path.exists(model_path):
             self._load_model(model_path)
         else:
-            print("⚠️ 未加载预训练模型，使用v3评分规则分类器")
+            print("⚠️ 未加载预训练模型，使用v5评分规则分类器")
     
     def _load_model(self, model_path: str):
         try:
@@ -84,6 +85,48 @@ class CatSoundClassifier:
             except Exception as e:
                 raise ValueError(f"音频格式转换失败(需要安装ffmpeg): {str(e)}")
     
+    @staticmethod
+    def _robust_f0_stats(f0_valid: np.ndarray) -> tuple:
+        """
+        用IQR过滤f0八度跳跃错误，返回robust统计量
+        
+        pyin在间歇性猫叫过渡帧会产生八度跳跃：
+        - 真实pitch ~440Hz，但过渡帧估计为 ~203Hz（低一个八度）
+        - 这些异常帧仅占23%，但把f0_std从6.5虚增到94.6
+        
+        IQR过滤方法：Q1-1.5*IQR ~ Q3+1.5*IQR范围外的视为异常值
+        真正的音高变化（痛苦哀鸣的剧烈波动）跨多帧，不会被过滤
+        """
+        if len(f0_valid) < 3:
+            return (float(f0_valid.mean()) if len(f0_valid) > 0 else 0,
+                    float(f0_valid.std()) if len(f0_valid) > 0 else 0,
+                    float(f0_valid.max() - f0_valid.min()) if len(f0_valid) > 0 else 0)
+        
+        q25, q75 = np.percentile(f0_valid, [25, 75])
+        iqr = q75 - q25
+        
+        # IQR过滤：保留 Q1-1.5*IQR ~ Q3+1.5*IQR 范围内的帧
+        lower_bound = q25 - 1.5 * iqr
+        upper_bound = q75 + 1.5 * iqr
+        filtered = f0_valid[(f0_valid >= lower_bound) & (f0_valid <= upper_bound)]
+        
+        # 如果过滤后帧太少（<50%），放宽过滤条件
+        if len(filtered) < len(f0_valid) * 0.5:
+            # 用MAD过滤代替：偏离中位数超过3*MAD的视为异常
+            median = np.median(f0_valid)
+            mad = np.median(np.abs(f0_valid - median))
+            if mad > 0:
+                filtered = f0_valid[np.abs(f0_valid - median) <= 3 * mad * 1.4826]
+            # 如果还是太少，用原始数据
+            if len(filtered) < len(f0_valid) * 0.3:
+                filtered = f0_valid
+        
+        f0_mean = float(np.mean(filtered))
+        f0_std = float(np.std(filtered))
+        f0_range = float(np.max(filtered) - np.min(filtered))
+        
+        return f0_mean, f0_std, f0_range
+    
     def extract_features(self, audio_path: str) -> Dict:
         """提取完整音频特征"""
         try:
@@ -120,21 +163,32 @@ class CatSoundClassifier:
             except:
                 spectral_flatness = 0.0
             
-            # 音高
+            # 音高提取 — ★ v5: 增加robust统计量
             try:
                 f0, voiced_flag, _ = librosa.pyin(
                     y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr
                 )
                 f0_valid = f0[~np.isnan(f0)]
                 if len(f0_valid) > 0:
-                    f0_mean = float(np.mean(f0_valid))
-                    f0_std = float(np.std(f0_valid))
-                    f0_range = float(np.max(f0_valid) - np.min(f0_valid))
+                    # 原始统计量（保留用于对比调试）
+                    f0_mean_raw = float(np.mean(f0_valid))
+                    f0_std_raw = float(np.std(f0_valid))
+                    f0_range_raw = float(np.max(f0_valid) - np.min(f0_valid))
                     voiced_ratio = float(np.sum(voiced_flag) / len(voiced_flag))
+                    
+                    # ★ v5核心修复：IQR过滤后的robust统计量
+                    f0_mean, f0_std, f0_range = self._robust_f0_stats(f0_valid)
+                    f0_median = float(np.median(f0_valid))
                 else:
-                    f0_mean, f0_std, f0_range, voiced_ratio = 0, 0, 0, 0
+                    f0_mean = f0_std = f0_range = 0
+                    f0_mean_raw = f0_std_raw = f0_range_raw = 0
+                    f0_median = 0
+                    voiced_ratio = 0
             except:
-                f0_mean, f0_std, f0_range, voiced_ratio = 0, 0, 0, 0
+                f0_mean = f0_std = f0_range = 0
+                f0_mean_raw = f0_std_raw = f0_range_raw = 0
+                f0_median = 0
+                voiced_ratio = 0
             
             # RMS帧级统计
             rms_frame = librosa.feature.rms(y=y)[0]
@@ -151,9 +205,13 @@ class CatSoundClassifier:
                 "duration": duration,
                 "spectral_contrast": spectral_contrast.tolist() if isinstance(spectral_contrast, np.ndarray) else spectral_contrast,
                 "spectral_flatness": float(spectral_flatness),
-                "f0_mean": f0_mean,
-                "f0_std": f0_std,
-                "f0_range": f0_range,
+                "f0_mean": f0_mean,           # ★ v5: robust mean
+                "f0_std": f0_std,             # ★ v5: robust std
+                "f0_range": f0_range,         # ★ v5: robust range
+                "f0_median": f0_median,       # ★ v5新增
+                "f0_mean_raw": f0_mean_raw,   # 调试对比用
+                "f0_std_raw": f0_std_raw,     # 调试对比用
+                "f0_range_raw": f0_range_raw, # 调试对比用
                 "voiced_ratio": voiced_ratio,
                 "rms_std": rms_std,
             }
@@ -204,7 +262,7 @@ class CatSoundClassifier:
                 "intent": intent,
                 "confidence": confidence,
                 "all_probs": probs,
-                "features_debug": features  # 调试用
+                "features_debug": features
             }
         except Exception as e:
             print(f"模型预测失败: {e}，降级为规则分类器")
@@ -212,20 +270,14 @@ class CatSoundClassifier:
     
     def _predict_with_rules(self, features: Dict) -> Dict:
         """
-        猫叫分类器 v4 — 决策树优先 + 评分兜底
+        猫叫分类器 v5 — 决策树优先 + 评分兜底
         
-        v4 vs v3 核心改动:
-        1. ★ brushing决策树增加f0_std否决：f0_std>30绝不判brushing
-           - 真实呼噜f0几乎不变(std<20)，驱虫叫声f0_std=94.6绝不是呼噜
-        2. 新增food决策树：中频centroid+有声+非噪声=meow
-        3. isolation评分f0加分限制centroid>2200（中频meow的f0波动不算焦虑）
-        4. brushing评分增加f0_std否决扣分
-        5. food评分增加voiced_ratio和f0_mean辅助
-        
-        手机录音对特征的影响:
-        - AGC → rms差异缩小，不作为主判据
-        - 降噪 → zcr和flatness偏低，不能单独作brushing判据
-        - 频率响应 → centroid和f0相对稳定，最可靠
+        v5 vs v4 核心改动:
+        1. ★ f0_std改用IQR过滤后的robust版本
+           - pyin八度跳跃错误被过滤：驱虫声94.6→6.5，不再误判pain
+           - 真正的pain变化保留：因为跨多帧的真实波动不会被IQR过滤
+        2. brushing决策树f0_std<20（robust版更准，真实呼噜f0_std<5）
+        3. pain规则阈值适配：长痛robust_f0_std>50，剧烈>40+ratio>0.15
         """
         centroid = features.get("spectral_centroid", 0)
         rms = features.get("rms", 0)
@@ -234,9 +286,10 @@ class CatSoundClassifier:
         bandwidth = features.get("spectral_bandwidth", 0)
         rolloff = features.get("spectral_rolloff", 0)
         flatness = features.get("spectral_flatness", 0)
-        f0_mean = features.get("f0_mean", 0)
-        f0_std = features.get("f0_std", 0)
-        f0_range = features.get("f0_range", 0)
+        f0_mean = features.get("f0_mean", 0)       # ★ v5: robust
+        f0_std = features.get("f0_std", 0)         # ★ v5: robust
+        f0_range = features.get("f0_range", 0)     # ★ v5: robust
+        f0_median = features.get("f0_median", 0)   # ★ v5新增
         voiced_ratio = features.get("voiced_ratio", 0)
         
         # ============================================================
@@ -244,26 +297,24 @@ class CatSoundClassifier:
         # ============================================================
         
         # 规则1: 呼噜 — centroid极低 + flatness极低 + f0_std极低
-        # ★ v4核心修复：真实呼噜f0几乎不变(std<20)，f0剧烈波动的绝不是呼噜
-        # 手机降噪可能让flatness变低，但不会产生稳定的f0
-        if centroid < 1200 and flatness < 0.01 and f0_std < 30:
+        # ★ v5: robust f0_std真实呼噜<5，收紧到<20更准确
+        if centroid < 1200 and flatness < 0.01 and f0_std < 20:
             return {
                 "intent": "brushing",
                 "confidence": 0.90,
                 "all_probs": {"brushing": 0.90, "food": 0.04, "isolation": 0.02, 
                               "happy": 0.02, "angry": 0.01, "pain": 0.01},
                 "features_debug": features,
-                "rule_hit": "decision_tree: brushing (centroid<1200 + flatness<0.01 + f0_std<30)"
+                "rule_hit": "decision_tree: brushing (centroid<1200 + flatness<0.01 + robust_f0_std<20)"
             }
         
-        # 规则2: 痛苦/哀鸣 — 长时 + f0剧烈波动
-        # ★ v4: 去掉centroid>2500限制，用f0_std/f0_mean比率区分pain和food
-        # 驱虫叫声: duration=3.83s + f0_std=94.6 + ratio=0.243 → pain
-        # 讨食meow: duration=2.37s + f0_std=82 + ratio=0.100 → food(不误判)
-        # 原理：pain的音高波动比例远大于food（哀鸣的音高剧烈抖动vs meow的温和变化）
+        # 规则2: 痛苦/哀鸣 — 长时 + f0剧烈波动（robust版）
+        # ★ v5: 使用robust f0_std，阈值调整适配
+        # 真正的痛苦哀鸣：f0在多帧间剧烈波动，IQR过滤后仍高
+        # 间歇性叫声的八度跳跃：IQR过滤后f0_std很低，不会误触发
         f0_variation_ratio = f0_std / max(f0_mean, 1) if f0_mean > 0 else 0
-        is_long_pain = duration > 3.0 and f0_std > 40  # 非常长的哀鸣
-        is_intense_pain = duration > 2.0 and f0_std > 60 and f0_variation_ratio > 0.15  # 中等长度但波动剧烈
+        is_long_pain = duration > 3.0 and f0_std > 50  # ★ v5: robust, >50
+        is_intense_pain = duration > 2.0 and f0_std > 40 and f0_variation_ratio > 0.15  # ★ v5: robust, >40
         
         if is_long_pain or is_intense_pain:
             return {
@@ -272,16 +323,13 @@ class CatSoundClassifier:
                 "all_probs": {"pain": 0.82, "isolation": 0.08, "angry": 0.05,
                               "food": 0.03, "happy": 0.01, "brushing": 0.01},
                 "features_debug": features,
-                "rule_hit": "decision_tree: pain (long distress or intense f0 variation)"
+                "rule_hit": "decision_tree: pain (long distress or intense f0 variation, robust_f0_std)"
             }
         
         # 规则3: 哈气hiss — 噪声信号
-        # hiss的特征: 高zcr(噪声) + 高centroid 或 高flatness
-        # ★ 关键: 纯meow虽然zcr可能>0.10，但会有f0波动，hiss没有f0
-        # 所以 angry = 高zcr/flatness + 无f0波动(或极短)
-        angry_signal = zcr > 0.20 or flatness > 0.15  # 强噪声信号
-        angry_weak = (zcr > 0.12 or flatness > 0.08) and centroid > 2500  # 降噪后弱信号+高频
-        not_isolation = f0_std < 30 or duration < 0.8  # 不是焦虑(焦虑有f0波动且长)
+        angry_signal = zcr > 0.20 or flatness > 0.15
+        angry_weak = (zcr > 0.12 or flatness > 0.08) and centroid > 2500
+        not_isolation = f0_std < 30 or duration < 0.8
         
         if (angry_signal or (angry_weak and not_isolation)):
             return {
@@ -294,7 +342,6 @@ class CatSoundClassifier:
             }
         
         # 规则4: 焦虑/害怕 — 高centroid + 长时 + f0波动大
-        # 焦虑猫叫的音高会剧烈变化，这是降噪无法消除的
         if centroid > 2500 and duration > 1.0 and (f0_std > 50 or f0_range > 200):
             return {
                 "intent": "isolation",
@@ -305,14 +352,13 @@ class CatSoundClassifier:
                 "rule_hit": "decision_tree: isolation (centroid>2500 + duration>1.0 + f0波动)"
             }
         
-        # ★ 规则5 (v4新增): 讨食meow — 中频centroid + 有声调 + 非噪声
-        # 这是最常见的猫叫声类型，v3漏了决策树规则导致进评分被isolation抢走
+        # 规则5: 讨食meow — 中频centroid + 有声调 + 非噪声
         is_mid_freq = 800 < centroid < 2400
         is_voiced = voiced_ratio > 0.25
         is_not_noisy = zcr < 0.22 and flatness < 0.20
         
         if is_mid_freq and is_voiced and is_not_noisy:
-            if duration > 0.5:  # 稍长的meow = 讨食
+            if duration > 0.5:
                 return {
                     "intent": "food",
                     "confidence": 0.82,
@@ -321,7 +367,7 @@ class CatSoundClassifier:
                     "features_debug": features,
                     "rule_hit": "decision_tree: food (mid-centroid + voiced + not-noisy)"
                 }
-            else:  # 极短的meow = 开心
+            else:
                 return {
                     "intent": "happy",
                     "confidence": 0.78,
@@ -331,7 +377,7 @@ class CatSoundClassifier:
                     "rule_hit": "decision_tree: happy (mid-centroid + voiced + short)"
                 }
         
-        # 规则6: 极短chirp — 非常短 + 中频
+        # 规则6: 极短chirp
         if duration < 0.35 and 1000 < centroid < 3500:
             return {
                 "intent": "happy",
@@ -344,71 +390,61 @@ class CatSoundClassifier:
         
         # ============================================================
         # 第二层：评分系统（决策树未命中时）
-        # v4关键修改: brushing评分增加f0_std否决，isolation的f0加分限centroid>2200
+        # v5: 全部使用robust f0_std
         # ============================================================
         scores = {label: 0.0 for label in self.LABELS}
         
         # --- BRUSHING (评分兜底) ---
-        # ★ v4: f0_std>30时brushing大幅扣分（呼噜f0必须稳定）
-        if f0_std < 20:
-            scores["brushing"] += 5  # f0很稳，强呼噜信号
-        elif f0_std < 30:
-            scores["brushing"] += 2  # f0较稳
-        # f0_std>30不加分，f0_std>50扣分
-        if f0_std > 50:
-            scores["brushing"] -= 4  # f0剧烈波动，绝不可能是呼噜
-        elif f0_std > 30:
+        # ★ v5: robust f0_std更准确，呼噜<5，非呼噜>10
+        if f0_std < 10:
+            scores["brushing"] += 5  # 极稳定f0，强呼噜信号
+        elif f0_std < 20:
+            scores["brushing"] += 2
+        if f0_std > 30:
+            scores["brushing"] -= 4  # robust版还高说明真有波动
+        elif f0_std > 20:
             scores["brushing"] -= 2
         
         if centroid < 1200:
             scores["brushing"] += 6
         elif centroid < 1800:
             scores["brushing"] += 2
-        # flatness极低辅助
         if flatness < 0.01:
             scores["brushing"] += 4
         elif flatness < 0.03:
             scores["brushing"] += 1
-        # f0极低辅助
         if 0 < f0_mean < 200:
             scores["brushing"] += 3
         elif 0 < f0_mean < 400:
             scores["brushing"] += 1
-        # rolloff低辅助
         if rolloff < 2000:
             scores["brushing"] += 2
         
-        # --- FOOD (评分兜底，v4加强) ---
-        # ★ v4: centroid在中频时food权重更高
+        # --- FOOD (评分兜底) ---
         if 800 < centroid < 2400:
-            scores["food"] += 7  # meow核心频段，v4提升
+            scores["food"] += 7
         elif 600 < centroid < 2800:
             scores["food"] += 3
         
         if 0.3 < duration < 2.5:
             scores["food"] += 2
         
-        # v4: 放宽flatness范围
         if 0.01 < flatness < 0.18:
             scores["food"] += 1.5
         
-        # v4: 放宽zcr范围
         if 0.03 < zcr < 0.18:
             scores["food"] += 1
         
         if 2000 < rolloff < 4500:
             scores["food"] += 1
         
-        # ★ v4新增: voiced_ratio中等 = 有声调的meow
         if voiced_ratio > 0.2:
             scores["food"] += 2
         
-        # ★ v4新增: f0_mean在猫叫典型范围(300-1200Hz)
         if 300 < f0_mean < 1200:
             scores["food"] += 2
         
         # --- ISOLATION (评分兜底) ---
-        # centroid高 + f0波动
         if centroid > 3500:
             scores["isolation"] += 7
         elif centroid > 2800:
@@ -423,8 +459,7 @@ class CatSoundClassifier:
         elif duration > 0.8:
             scores["isolation"] += 1.5
         
-        # ★ v4核心修改: f0波动只在centroid>2200时才给isolation加分
-        # 中频meow(centroid 800-2400)也有f0波动，但那是food不是isolation
+        # f0波动只在centroid>2200时才给isolation加分
         if centroid > 2200:
             if f0_std > 80:
                 scores["isolation"] += 4
@@ -435,7 +470,6 @@ class CatSoundClassifier:
             elif f0_range > 150:
                 scores["isolation"] += 1
         
-        # 高rolloff辅助
         if rolloff > 5000:
             scores["isolation"] += 2
         elif rolloff > 3500:
@@ -454,7 +488,6 @@ class CatSoundClassifier:
             scores["happy"] += 2
         
         # --- ANGRY (评分兜底) ---
-        # zcr和flatness是主信号（即使被降噪压低，仍有一定区分度）
         if zcr > 0.20:
             scores["angry"] += 6
         elif zcr > 0.15:
@@ -469,19 +502,18 @@ class CatSoundClassifier:
         elif flatness > 0.05:
             scores["angry"] += 0.5
         
-        # centroid极高也是angry信号
         if centroid > 4000:
             scores["angry"] += 3
         elif centroid > 3000:
             scores["angry"] += 1.5
         
-        # rolloff极高
         if rolloff > 6000:
             scores["angry"] += 2
         elif rolloff > 4500:
             scores["angry"] += 1
         
         # --- PAIN (评分兜底) ---
+        # ★ v5: 使用robust f0_std，阈值适配
         if duration > 2.5:
             scores["pain"] += 5
         elif duration > 1.5:
@@ -489,9 +521,9 @@ class CatSoundClassifier:
         elif duration > 1.0:
             scores["pain"] += 1
         
-        if f0_std > 100:
+        if f0_std > 80:
             scores["pain"] += 4
-        elif f0_std > 60:
+        elif f0_std > 50:
             scores["pain"] += 2
         
         if f0_range > 400:
@@ -507,7 +539,6 @@ class CatSoundClassifier:
         # ============================================================
         score_array = np.array([scores[k] for k in self.LABELS])
         
-        # 最低分保障：没有强信号时默认food（一般meow）
         if np.max(score_array) < 2:
             scores["food"] += 2
             score_array = np.array([scores[k] for k in self.LABELS])
