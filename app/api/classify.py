@@ -1,6 +1,7 @@
 """
-猫叫分类 API v3
+猫叫分类 API v4
 - 返回值增加 features_debug 字段，方便调试手机录音特征
+- v4: classify端点默认返回features字段（不再需要debug参数）
 """
 import os
 import uuid
@@ -90,13 +91,26 @@ async def classify_sound(audio: UploadFile = File(...), debug: bool = Query(Fals
             "detail": {
                 "intent": intent_key,
                 "raw_confidence": result.get("confidence", 0),
-                "all_probs": result.get("all_probs", {})
+                "all_probs": result.get("all_probs", {}),
+                "rule_hit": result.get("rule_hit", "")
             }
         }
         
-        # debug模式返回原始特征
-        if debug or result.get("features_debug"):
-            response["features"] = result.get("features_debug", {})
+        # 始终返回关键特征（v4改动：不再需要debug参数）
+        features = result.get("features_debug", {})
+        response["features"] = {
+            "spectral_centroid": features.get("spectral_centroid"),
+            "zcr": features.get("zcr"),
+            "spectral_flatness": features.get("spectral_flatness"),
+            "duration": features.get("duration"),
+            "f0_mean": features.get("f0_mean"),
+            "f0_std": features.get("f0_std"),
+            "f0_range": features.get("f0_range"),
+            "voiced_ratio": features.get("voiced_ratio"),
+        }
+        
+        if debug:
+            response["features_full"] = features
         
         return response
         
