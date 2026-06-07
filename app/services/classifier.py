@@ -180,6 +180,20 @@ class CatSoundClassifier:
                 f0_median = 0
                 voiced_ratio = 0
             
+            # ★ v6.1新增: 帧间f0变化中位数 — 区分多段meow与持续哀鸣
+            # 多段meow: 段间音高跳变大(全局f0_std高)但段内帧间变化极小(median<10)
+            # 持续哀鸣: 逐帧剧烈变化(median>20)
+            try:
+                f0_series = f0.copy()
+                f0_series[np.isnan(f0_series)] = 0
+                frame_diffs = []
+                for i in range(1, len(f0_series)):
+                    if f0_series[i] > 0 and f0_series[i-1] > 0:
+                        frame_diffs.append(abs(f0_series[i] - f0_series[i-1]))
+                f0_frame_diff_median = float(np.median(frame_diffs)) if len(frame_diffs) > 0 else 0.0
+            except:
+                f0_frame_diff_median = 0.0
+            
             # 高频能量比
             try:
                 S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
@@ -215,6 +229,7 @@ class CatSoundClassifier:
                 "voiced_ratio": voiced_ratio,
                 "rms_std": rms_std,
                 "high_freq_energy_ratio": high_freq_energy_ratio,
+                "f0_frame_diff_median": f0_frame_diff_median,  # ★ v6.1新增
             }
             
             return features
@@ -293,6 +308,7 @@ class CatSoundClassifier:
         f0_median = features.get("f0_median", 0)
         voiced_ratio = features.get("voiced_ratio", 0)
         hf_ratio = features.get("high_freq_energy_ratio", 0)
+        f0_frame_diff_median = features.get("f0_frame_diff_median", 0)  # ★ v6.1新增
         
         # ============================================================
         # 第一层：决策树快速判断（铁证级别，不进评分）
@@ -348,17 +364,18 @@ class CatSoundClassifier:
                 "rule_hit": "decision_tree: chattering (centroid 1500-2000 + flatness<0.02 + hf_ratio>0.40 + f0_std<25)"
             }
         
-        # 规则3: 痛苦/哀鸣 — 长时 + f0剧烈波动 + 高centroid
-        # ★ v6.1: 区分痛苦(高频wailing)和烦躁(低频反复叫)
-        #   痛苦哀鸣: centroid>1500 (高频wailing) + f0波动大
-        #   烦躁不满: centroid<1500 (低频反复叫) + f0波动大 → 归入angry
+        # 规则3: 痛苦/哀鸣 — 长时 + f0剧烈波动 + 高centroid + 帧间变化大
+        # ★ v6.1: 用f0_frame_diff_median区分多段meow与持续哀鸣
+        #   多段meow(讨食): 全局f0_std高(多段不同音高) 但帧间变化中位数极小(<10)
+        #   持续哀鸣(痛苦): 逐帧f0剧烈变化(帧间变化中位数>15)
+        #   烦躁(不满): centroid<1500 + f0_std高 但不是持续哀鸣
         f0_variation_ratio = f0_std / max(f0_mean, 1) if f0_mean > 0 else 0
-        is_long_pain = duration > 3.0 and f0_std > 50 and centroid > 1500  # ★ v6.1: 加centroid>1500
-        is_intense_pain = duration > 2.0 and f0_std > 40 and f0_variation_ratio > 0.15 and centroid > 1500  # ★ v6.1: 加centroid>1500
+        is_truly_wailing = f0_frame_diff_median > 15  # ★ v6.1: 真正的逐帧f0抖动
+        is_long_pain = duration > 3.0 and f0_std > 50 and centroid > 1500 and is_truly_wailing
+        is_intense_pain = duration > 2.0 and f0_std > 40 and f0_variation_ratio > 0.15 and centroid > 1500 and is_truly_wailing
         
-        # ★ v6.1新增: 烦躁/不满 — 长时 + f0波动大 + 低centroid (反复低音叫)
-        # 这不是痛苦哀鸣(高音wailing)，而是烦躁地反复叫
-        is_irritated = duration > 2.0 and f0_std > 40 and centroid < 1500
+        # ★ v6.1: 烦躁/不满 — 长时 + 低centroid + 真正逐帧抖动(非多段meow)
+        is_irritated = duration > 2.0 and f0_std > 40 and centroid < 1500 and is_truly_wailing
         
         if is_irritated:
             return {
@@ -406,11 +423,10 @@ class CatSoundClassifier:
                 "rule_hit": "decision_tree: isolation (centroid>2500 + duration>1.0 + f0波动)"
             }
         
-        # 规则6: 讨食meow — 中频centroid + 有声调 + 非噪声 + ★flatness>0.02(排除chattering)
-        # v6关键改动：food决策树增加flatness>0.02前置条件
-        # chattering的flatness<0.02已被规则2截获，不会到这里
-        # 但评分兜底时仍需额外保护
-        is_mid_freq = 800 < centroid < 2400
+        # 规则6: 讨食meow — 中高频centroid + 有声调 + 非噪声 + ★flatness>0.02(排除chattering)
+        # ★ v6.1: centroid下限1100，排除低centroid烦躁声(centroid~1054)
+        # 真正讨食的meow centroid通常>1200，烦躁反复叫的centroid<1100
+        is_mid_freq = 1100 < centroid < 2400  # ★ v6.1: 800→1100
         is_voiced = voiced_ratio > 0.25
         is_not_noisy = zcr < 0.22 and flatness < 0.20
         is_not_chattering_pattern = flatness > 0.02 or hf_ratio < 0.20 or f0_std > 30  # ★ v6: 排除chattering
@@ -523,9 +539,9 @@ class CatSoundClassifier:
             scores["brushing"] += 2
         
         # --- FOOD (评分兜底) ---
-        if 800 < centroid < 2400:
+        if 1100 < centroid < 2400:  # ★ v6.1: 800→1100
             scores["food"] += 7
-        elif 600 < centroid < 2800:
+        elif 800 < centroid < 2800:  # 降级范围
             scores["food"] += 3
         
         # ★ v6: chattering模式的音频不再给food加分
@@ -623,13 +639,17 @@ class CatSoundClassifier:
         elif rolloff > 4500:
             scores["angry"] += 1
         
+        # ★ v6.1新增: 低centroid + 高f0_std + 不是wailing = 烦躁/不满
+        # 反复叫但不是痛苦哀鸣(f0逐帧稳定，只是段间音高跨度大)
+        if centroid < 1500 and f0_std > 40 and f0_frame_diff_median < 15:
+            scores["angry"] += 12  # 烦躁反复叫的强信号（v6.1: 8→12）
+        
         # --- PAIN (评分兜底) ---
+        # ★ v6.1: 不是真正wailing时pain降权
         if duration > 2.5:
             scores["pain"] += 5
         elif duration > 1.5:
             scores["pain"] += 3
-        elif duration > 1.0:
-            scores["pain"] += 1
         
         if f0_std > 80:
             scores["pain"] += 4
@@ -643,6 +663,10 @@ class CatSoundClassifier:
         
         if centroid > 2500:
             scores["pain"] += 1
+        
+        # ★ v6.1: f0_frame_diff_median低说明是反复meow而非持续哀鸣，pain扣分
+        if f0_frame_diff_median < 10 and f0_std > 30:
+            scores["pain"] -= 6  # 不是wailing但f0_std高=多段meow，不是pain
         
         # ============================================================
         # Softmax 转概率
