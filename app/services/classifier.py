@@ -388,8 +388,13 @@ class CatSoundClassifier:
         #         讨食反复  centroid=1722, f0_std=344,  voiced_ratio=0.56
         #         烦躁声    centroid=1054, f0_std=115.4, voiced_ratio=0.64
         # voiced_ratio是关键区分：food断续叫(0.3-0.6) vs 抱怨连续叫(>0.6)
+        # ★ 重要排除：反复meow(高f0_std>150 + 低fdm<10)不是抱怨，是food！
+        #   反复meow的f0_std极高是因为多段meow音高不同，但每段内部f0很稳定(fdm低)
+        #   连续抱怨的f0_std适中(40-150)，是持续发声+适度抖动
+        is_repeated_meow = f0_std > 150 and f0_frame_diff_median < 10
         is_complaining = (duration > 1.5 and f0_std > 40 and centroid < 1500 
-                         and voiced_ratio > 0.6 and f0_frame_diff_median < 15)
+                         and voiced_ratio > 0.6 and f0_frame_diff_median < 15
+                         and not is_repeated_meow)
         
         if is_irritated or is_complaining:
             return {
@@ -445,7 +450,9 @@ class CatSoundClassifier:
         is_not_noisy = zcr < 0.22 and flatness < 0.20
         is_not_chattering_pattern = flatness > 0.02 or hf_ratio < 0.20 or f0_std > 30  # ★ v6: 排除chattering
         # ★ v6.2: 排除连续抱怨 — 低centroid+高f0_std+高voiced_ratio = 不满/抱怨，不是food
-        is_not_complaining = centroid >= 1500 or f0_std <= 40 or voiced_ratio <= 0.6
+        # 但反复meow(高f0_std>150+低fdm<10)不是抱怨，不能排除
+        is_repeated_meow_check = f0_std > 150 and f0_frame_diff_median < 10
+        is_not_complaining = centroid >= 1500 or f0_std <= 40 or voiced_ratio <= 0.6 or is_repeated_meow_check
         
         if is_mid_freq and is_voiced and is_not_noisy and is_not_chattering_pattern and is_not_complaining:
             if duration > 0.5:
@@ -657,12 +664,14 @@ class CatSoundClassifier:
         
         # ★ v6.1新增: 低centroid + 高f0_std + 不是wailing = 烦躁/不满
         # 反复叫但不是痛苦哀鸣(f0逐帧稳定，只是段间音高跨度大)
-        if centroid < 1500 and f0_std > 40 and f0_frame_diff_median < 15:
+        # ★ v6.2: 排除反复meow(高f0_std>150+低fdm<10)——那是food不是烦躁
+        if centroid < 1500 and f0_std > 40 and f0_frame_diff_median < 15 and not (f0_std > 150 and f0_frame_diff_median < 10):
             scores["angry"] += 12  # 烦躁反复叫的强信号（v6.1: 8→12）
         
         # ★ v6.2新增: 连续抱怨 — 高voiced_ratio(连续发声) + 低centroid + 高f0_std
         # voiced_ratio>0.6 = 几乎不停地在叫 = 不满/抱怨，不是food那种断续meow
-        if centroid < 1500 and f0_std > 40 and voiced_ratio > 0.6 and f0_frame_diff_median < 15:
+        # 但排除反复meow(高f0_std+低fdm)——那是food不是抱怨
+        if centroid < 1500 and 40 < f0_std <= 150 and voiced_ratio > 0.6 and f0_frame_diff_median < 15:
             scores["angry"] += 8  # 连续抱怨额外加分
         
         # --- PAIN (评分兜底) ---
