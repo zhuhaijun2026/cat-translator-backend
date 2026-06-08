@@ -1,8 +1,12 @@
 """
-猫叫分类器服务 v6
-- v5基础上新增chattering(驱赶/追逐)类别
-- v5修了brushing误判，但驱赶飞虫声落到food——声学特征类似但语义不对
-- 核心发现：chattering声学指纹 = 呼噜的低centroid/低flatness + meow的高hf_ratio
+猫叫分类器服务 v6.2
+- v6.1基础上修复不满抱怨声被误判food
+- v6.1修了反复meow讨食被误判pain，但不满抱怨声centroid在food范围内被food决策树截获
+- 核心发现：不满抱怨 voiced_ratio>0.6(连续发声) vs food voiced_ratio 0.3-0.6(断续meow)
+- v6.2修复：
+  1. 新增"连续抱怨"决策树规则：低centroid+高f0_std+高voiced_ratio → angry
+  2. food决策树增加非连续抱怨条件
+  3. angry评分增加连续抱怨加分
   这是猫独有的混合发声：同时发出低频呼噜和中高频meow（驱赶猎物时特有）
 - 区分food vs chattering的关键：
   food: centroid>1200, flatness>0.05, f0_std>20 (典型meow)
@@ -377,7 +381,17 @@ class CatSoundClassifier:
         # ★ v6.1: 烦躁/不满 — 长时 + 低centroid + 真正逐帧抖动(非多段meow)
         is_irritated = duration > 2.0 and f0_std > 40 and centroid < 1500 and is_truly_wailing
         
-        if is_irritated:
+        # ★ v6.2: 连续抱怨 — 低centroid + 高f0_std + 高voiced_ratio(几乎连续发声)
+        # 不满抱怨的猫几乎不停地在叫(voiced_ratio>0.6)，不是food那种断续meow(voiced_ratio 0.3-0.6)
+        # 真实数据：不满抱怨 centroid=1334, f0_std=65.5, voiced_ratio=0.91, fdm=5.5
+        # 对比：  讨食meow  centroid=1516, f0_std=40.9, voiced_ratio=0.41
+        #         讨食反复  centroid=1722, f0_std=344,  voiced_ratio=0.56
+        #         烦躁声    centroid=1054, f0_std=115.4, voiced_ratio=0.64
+        # voiced_ratio是关键区分：food断续叫(0.3-0.6) vs 抱怨连续叫(>0.6)
+        is_complaining = (duration > 1.5 and f0_std > 40 and centroid < 1500 
+                         and voiced_ratio > 0.6 and f0_frame_diff_median < 15)
+        
+        if is_irritated or is_complaining:
             return {
                 "intent": "angry",
                 "confidence": 0.82,
@@ -430,8 +444,10 @@ class CatSoundClassifier:
         is_voiced = voiced_ratio > 0.25
         is_not_noisy = zcr < 0.22 and flatness < 0.20
         is_not_chattering_pattern = flatness > 0.02 or hf_ratio < 0.20 or f0_std > 30  # ★ v6: 排除chattering
+        # ★ v6.2: 排除连续抱怨 — 低centroid+高f0_std+高voiced_ratio = 不满/抱怨，不是food
+        is_not_complaining = centroid >= 1500 or f0_std <= 40 or voiced_ratio <= 0.6
         
-        if is_mid_freq and is_voiced and is_not_noisy and is_not_chattering_pattern:
+        if is_mid_freq and is_voiced and is_not_noisy and is_not_chattering_pattern and is_not_complaining:
             if duration > 0.5:
                 return {
                     "intent": "food",
@@ -643,6 +659,11 @@ class CatSoundClassifier:
         # 反复叫但不是痛苦哀鸣(f0逐帧稳定，只是段间音高跨度大)
         if centroid < 1500 and f0_std > 40 and f0_frame_diff_median < 15:
             scores["angry"] += 12  # 烦躁反复叫的强信号（v6.1: 8→12）
+        
+        # ★ v6.2新增: 连续抱怨 — 高voiced_ratio(连续发声) + 低centroid + 高f0_std
+        # voiced_ratio>0.6 = 几乎不停地在叫 = 不满/抱怨，不是food那种断续meow
+        if centroid < 1500 and f0_std > 40 and voiced_ratio > 0.6 and f0_frame_diff_median < 15:
+            scores["angry"] += 8  # 连续抱怨额外加分
         
         # --- PAIN (评分兜底) ---
         # ★ v6.1: 不是真正wailing时pain降权
